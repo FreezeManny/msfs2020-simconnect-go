@@ -20,11 +20,11 @@ type SimVar struct {
 }
 
 var (
-	receiveDataInterval = time.Millisecond * 1 // Check for dispatches very frequently
-	simConnect          *simconnect.SimConnect
-	simVars             []*SimVar
-	lastValues          = make(map[simconnect.DWord]float64)
-	updateCounter       int
+	simConnect    *simconnect.SimConnect
+	simVars       []*SimVar
+	simVarLookup  map[simconnect.DWord]*SimVar // Fast O(1) lookup
+	lastValues    = make(map[simconnect.DWord]float64)
+	updateCounter int
 )
 func main() {
 	additionalSearchPath := ""
@@ -44,20 +44,23 @@ func main() {
 	}
 
 	simVars = make([]*SimVar, 0)
-	nameUnitMapping := map[string]string{
-		"COM ACTIVE FREQUENCY:1": "MHz",
-		"COM STANDBY FREQUENCY:1": "MHz",
-		"COM ACTIVE FREQUENCY:2": "MHz",
-		"COM STANDBY FREQUENCY:2": "MHz",
+	simVarLookup = make(map[simconnect.DWord]*SimVar)
+	
+	// Use slice for deterministic order
+	nameUnitPairs := []struct{ name, unit string }{
+		{"COM ACTIVE FREQUENCY:1", "MHz"},
+		{"COM STANDBY FREQUENCY:1", "MHz"},
+		{"COM ACTIVE FREQUENCY:2", "MHz"},
+		{"COM STANDBY FREQUENCY:2", "MHz"},
 	}
 	
 	// Setup data definitions and subscribe to automatic updates
-	for name, unit := range nameUnitMapping {
+	for _, pair := range nameUnitPairs {
 		defineID := simconnect.NewDefineID()
 		requestID := simconnect.NewRequestID()
 		
 		// Add the data definition
-		simConnect.AddToDataDefinition(defineID, name, unit, simconnect.DataTypeFloat64)
+		simConnect.AddToDataDefinition(defineID, pair.name, pair.unit, simconnect.DataTypeFloat64)
 		
 		// Request event-driven updates: data will be pushed automatically
 		// No need to poll! SimConnect will send updates when values change
@@ -69,8 +72,10 @@ func main() {
 			simconnect.DWordZero,         // flags
 		)
 		
-		simVars = append(simVars, &SimVar{defineID, name, unit})
-		fmt.Printf("Subscribed to '%s' with event-driven updates (~60 FPS)\n", name)
+		simVar := &SimVar{defineID, pair.name, pair.unit}
+		simVars = append(simVars, simVar)
+		simVarLookup[defineID] = simVar // O(1) lookup map
+		fmt.Printf("Subscribed to '%s' with event-driven updates (~60 FPS)\n", pair.name)
 	}
 
 	done := make(chan bool, 1)
@@ -140,12 +145,13 @@ func HandleTerminationSignal(done chan bool) {
 }
 
 func HandleEvents(done chan bool) {
-	recvDataTicker := time.NewTicker(receiveDataInterval)
-	defer recvDataTicker.Stop()
-
+	// No ticker! Just continuously check for dispatches
+	// GetNextDispatch blocks efficiently when no data available
 	for {
 		select {
-		case <-recvDataTicker.C:
+		case <-done:
+			return
+		default:
 			// Check for incoming dispatches from SimConnect
 			// Data is pushed automatically by SimConnect (event-driven!)
 			ppData, r1, err := simConnect.GetNextDispatch()
@@ -154,9 +160,9 @@ func HandleEvents(done chan bool) {
 					fmt.Printf("GetNextDispatch error: %d %s\n", r1, err)
 					return
 				}
-				if ppData == nil {
-					break
-				}
+				// No data available, yield briefly to avoid busy loop
+				time.Sleep(time.Millisecond)
+				continue
 			}
 
 			recv := *(*simconnect.Recv)(ppData)
@@ -167,6 +173,7 @@ func HandleEvents(done chan bool) {
 			case simconnect.RecvIDQuit:
 				fmt.Println("Disconnected from Flight Simulator.")
 				done <- true
+				return
 
 			case simconnect.RecvIDException:
 				recvException := *(*simconnect.RecvException)(ppData)
@@ -176,17 +183,19 @@ func HandleEvents(done chan bool) {
 				// This is the event-driven data response from RequestDataOnSimObject
 				data := *(*simconnect.RecvSimObjectData)(ppData)
 				updateCounter++
-				for _, simVar := range simVars {
-					if simVar.DefineID == data.DefineID {
-						val := *(*float64)(unsafe.Pointer(uintptr(ppData) + unsafe.Sizeof(data)))
-						lastVal, ok := lastValues[simVar.DefineID]
-						// Always show first value, then only on change
-						if !ok || val != lastVal {
-							timestamp := time.Now().Format("15:04:05.000")
-							fmt.Printf("[%s] [#%d] %s: %.3f %s\n", timestamp, updateCounter, simVar.Name, val, simVar.Unit)
-							lastValues[simVar.DefineID] = val
-						}
-						break
+				
+				// O(1) lookup instead of O(n) loop
+				if simVar, exists := simVarLookup[data.DefineID]; exists {
+					val := *(*float64)(unsafe.Pointer(uintptr(ppData) + unsafe.Sizeof(data)))
+					lastVal, ok := lastValues[data.DefineID]
+					// Always show first value, then only on change
+					if !ok || val != lastVal {
+						// Reuse time object to avoid allocation
+						now := time.Now()
+						fmt.Printf("[%02d:%02d:%02d.%03d] [#%d] %s: %.3f %s\n", 
+							now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/1000000,
+							updateCounter, simVar.Name, val, simVar.Unit)
+						lastValues[data.DefineID] = val
 					}
 				}
 
@@ -194,16 +203,17 @@ func HandleEvents(done chan bool) {
 				// Fallback handler in case any ByType responses come through
 				data := *(*simconnect.RecvSimObjectDataByType)(ppData)
 				updateCounter++
-				for _, simVar := range simVars {
-					if simVar.DefineID == data.DefineID {
-						val := *(*float64)(unsafe.Pointer(uintptr(ppData) + unsafe.Sizeof(data)))
-						lastVal, ok := lastValues[simVar.DefineID]
-						if !ok || val != lastVal {
-							timestamp := time.Now().Format("15:04:05.000")
-							fmt.Printf("[%s] [#%d] %s: %.3f %s\n", timestamp, updateCounter, simVar.Name, val, simVar.Unit)
-							lastValues[simVar.DefineID] = val
-						}
-						break
+				
+				// O(1) lookup instead of O(n) loop
+				if simVar, exists := simVarLookup[data.DefineID]; exists {
+					val := *(*float64)(unsafe.Pointer(uintptr(ppData) + unsafe.Sizeof(data)))
+					lastVal, ok := lastValues[data.DefineID]
+					if !ok || val != lastVal {
+						now := time.Now()
+						fmt.Printf("[%02d:%02d:%02d.%03d] [#%d] %s: %.3f %s\n", 
+							now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/1000000,
+							updateCounter, simVar.Name, val, simVar.Unit)
+						lastValues[data.DefineID] = val
 					}
 				}
 			}
