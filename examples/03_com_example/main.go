@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -69,14 +68,42 @@ func main() {
 	input = strings.TrimSpace(input)
 	freq, err := strconv.ParseFloat(input, 64)
 	if err == nil {
-		defineID := simVars[1].DefineID // COM STANDBY FREQUENCY:1
-		buffer := [1]float64{freq}
-		size := simconnect.DWord(8) // float64 size
-		simConnect.SetDataOnSimObject(defineID, simconnect.ObjectIDUser, 0, 0, size, unsafe.Pointer(&buffer[0]))
-		fmt.Printf("Set COM1 Standby to %.3f MHz\n", freq)
-	} else {
-		fmt.Println("Invalid frequency input, skipping set.")
-	}
+		// Convert MHz to BCD16 format (COM radios use BCD encoding)
+		// Example: 122.800 -> 0x2800 (BCD16)
+		wholePart := int(freq)
+		fractionalPart := int((freq - float64(wholePart)) * 1000)
+		
+		// BCD encode: each digit becomes a nibble
+		freqBCD := uint32((wholePart/100)%10)<<12 | 
+                   uint32((wholePart/10)%10)<<8 | 
+                   uint32(wholePart%10)<<4 | 
+                   uint32((fractionalPart/100)%10)
+        freqBCD = (freqBCD << 16) | uint32((fractionalPart/10)%10)<<12 | uint32(fractionalPart%10)<<8
+
+        // Map client event to sim event
+        eventID := simconnect.NewEventID()
+        groupID := simconnect.DWord(0) // Use a simple group ID instead of NewGroupID
+        
+        simConnect.MapClientEventToSimEvent(eventID, "COM_STBY_RADIO_SET_HZ")
+        simConnect.AddClientEventToNotificationGroup(groupID, eventID, false)
+        simConnect.SetNotificationGroupPriority(groupID, simconnect.GroupPriorityHighest)
+
+        // Transmit the event using BCD format
+        err := simConnect.TransmitClientEvent(
+            uint32(simconnect.ObjectIDUser),
+            uint32(eventID),
+            simconnect.DWord(freqBCD),
+            groupID,
+            simconnect.EventFlagGroupIDIsPriority,
+        )
+        if err != nil {
+            fmt.Printf("Failed to set COM1 Standby: %v\n", err)
+        } else {
+            fmt.Printf("Set COM1 Standby to %.3f MHz (BCD: 0x%X)\n", freq, freqBCD)
+        }
+    } else {
+        fmt.Println("Invalid frequency input, skipping set.")
+    }
 
 	<-done
 
