@@ -68,17 +68,9 @@ func main() {
 	input = strings.TrimSpace(input)
 	freq, err := strconv.ParseFloat(input, 64)
 	if err == nil {
-		// Convert MHz to BCD16 format (COM radios use BCD encoding)
-		// Example: 122.800 -> 0x2800 (BCD16)
-		wholePart := int(freq)
-		fractionalPart := int((freq - float64(wholePart)) * 1000)
-		
-		// BCD encode: each digit becomes a nibble
-		freqBCD := uint32((wholePart/100)%10)<<12 | 
-                   uint32((wholePart/10)%10)<<8 | 
-                   uint32(wholePart%10)<<4 | 
-                   uint32((fractionalPart/100)%10)
-        freqBCD = (freqBCD << 16) | uint32((fractionalPart/10)%10)<<12 | uint32(fractionalPart%10)<<8
+		// COM_STBY_RADIO_SET_HZ expects frequency in Hz as a plain integer
+		// Example: 123.450 MHz -> 123450000 Hz
+		freqHz := uint32(freq * 1000000)
 
         // Map client event to sim event
         eventID := simconnect.NewEventID()
@@ -88,18 +80,18 @@ func main() {
         simConnect.AddClientEventToNotificationGroup(groupID, eventID, false)
         simConnect.SetNotificationGroupPriority(groupID, simconnect.GroupPriorityHighest)
 
-        // Transmit the event using BCD format
+        // Transmit the event with frequency in Hz
         err := simConnect.TransmitClientEvent(
             uint32(simconnect.ObjectIDUser),
             uint32(eventID),
-            simconnect.DWord(freqBCD),
+            simconnect.DWord(freqHz),
             groupID,
             simconnect.EventFlagGroupIDIsPriority,
         )
         if err != nil {
             fmt.Printf("Failed to set COM1 Standby: %v\n", err)
         } else {
-            fmt.Printf("Set COM1 Standby to %.3f MHz (BCD: 0x%X)\n", freq, freqBCD)
+            fmt.Printf("Set COM1 Standby to %.3f MHz (%d Hz)\n", freq, freqHz)
         }
     } else {
         fmt.Println("Invalid frequency input, skipping set.")
