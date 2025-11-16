@@ -20,7 +20,7 @@ type SimVar struct {
 }
 
 var (
-	requestDataInterval = time.Millisecond * 250
+	requestDataInterval = time.Millisecond * 100
 	receiveDataInterval = time.Millisecond * 1
 	simConnect          *simconnect.SimConnect
 	simVars             []*SimVar
